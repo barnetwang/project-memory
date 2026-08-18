@@ -1,0 +1,20 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local Databases & WAL logs
+*.db
+*.db-wal
+*.db-shm
+.project-memory/
+
+# Testing & Temp files
+*.jsonl
+scratch/
+.pytest_cache/
+.coverage
+
+# OS generated files
+.DS_Store
+Thumbs.db
