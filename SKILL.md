@@ -1,6 +1,9 @@
 ---
 name: project-memory
-description: 專為 AI Coding / Engineering Agent 設計的 Failure-Aware, Evidence-Grounded Episodic Engineering Memory 結構化專案記憶中樞。支援情境-症狀-根因-解法 Tuple、細粒度負向知識（Invalid Paths 試錯剪枝）、狀態機（嚴格區分 Closed 與 Verified）、證據與 Git Commit 硬錨定、全欄位機密掃描、Repo 本地與全域資料庫隔離及兩階段低 Token 檢索。
+description: "Use for engineering debug: recall cases and reject-paths."
+version: 3.1.0
+author: Barnet Wang
+license: Apache-2.0
 ---
 
 # Failure-Aware Episodic Engineering Memory Skill (v3.1.0)
