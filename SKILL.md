@@ -1,18 +1,18 @@
 ---
 name: project-memory
 description: "Use for engineering debug: recall cases and reject-paths."
-version: 3.2.0
+version: 3.2.1
 author: Barnet Wang
 license: Apache-2.0
 ---
 
-# Failure-Aware Episodic Engineering Memory Skill (v3.2.0)
+# Failure-Aware Episodic Engineering Memory Skill (v3.2.1)
 
 This skill gives the agent a persistent, cross-conversation memory of **structured engineering decisions and negative knowledge**. It is optimized for **open-source local small models (7B / 14B)** and for **environments mixing Traditional/Simplified Chinese, English, and ACPI underscore-named paths**.
 
 ---
 
-## 🎯 Core Workflow & When to Use (Agent Workflow)
+## Core Workflow & When to Use (Agent Workflow)
 
 ### 1. Before Starting / Debugging (Answer, Search & Similar — one-shot reasoning + dedupe)
 * **Agent decision evidence card (`answer` / `card`)**: **the recommended first call when a session starts**.
@@ -39,7 +39,7 @@ This skill gives the agent a persistent, cross-conversation memory of **structur
 
 ---
 
-## 🚦 Small-Model Decision Indicator (`decision`) Reference
+## Small-Model Decision Indicator (`decision`) Reference
 
 | `decision` value | Trigger condition | Action guideline for 7B / 14B local models |
 |---|---|---|
@@ -52,7 +52,7 @@ This skill gives the agent a persistent, cross-conversation memory of **structur
 
 ---
 
-## 🛠️ CLI Reference
+## CLI Reference
 
 Script location: `scripts/memory_manager.py` (supports the global `--db <path>` option).
 
