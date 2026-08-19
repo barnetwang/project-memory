@@ -1,12 +1,12 @@
 ---
 name: project-memory
 description: "Use for engineering debug: recall cases and reject-paths."
-version: 3.2.1
+version: 3.2.2
 author: Barnet Wang
 license: Apache-2.0
 ---
 
-# Failure-Aware Episodic Engineering Memory Skill (v3.2.1)
+# Failure-Aware Episodic Engineering Memory Skill (v3.2.2)
 
 This skill gives the agent a persistent, cross-conversation memory of **structured engineering decisions and negative knowledge**. It is optimized for **open-source local small models (7B / 14B)** and for **environments mixing Traditional/Simplified Chinese, English, and ACPI underscore-named paths**.
 

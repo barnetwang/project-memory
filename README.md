@@ -8,30 +8,30 @@
 
 ---
 
-## ✨ 本地端弱模型專屬四大革新 (Small-Model Innovations)
+## 本地端弱模型專屬四大革新 (Small-Model Innovations)
 
-### 1. 🎴 零歧義決策指示 (`decision` 欄位)
+### 1. 零歧義決策指示 (`decision` 欄位)
 - 7B/14B 弱模型往往無法可靠推理複雜的多狀態與置信度組合。本系統在 Stage 1 `search` 與 Stage 2 `get` 中直接計算並輸出 **`decision` 決策指示**：
-  - `adopt`：最高置信度 Verified 解法，直接採納。
-  - `adopt_after_check`：已結案且附帶 Commit/測試證據，確認條件後採納。
-  - `candidate`：已結案但缺乏實體證據，僅供參考。
-  - `avoid`：排除路徑 / 負向知識 / 廢棄方案，**主動避開**。
-  - `superseded`：方案已過期被新單取代，提示改查新單。
-  - `reference_only`：排查中草稿。
+ - `adopt`：最高置信度 Verified 解法，直接採納。
+ - `adopt_after_check`：已結案且附帶 Commit/測試證據，確認條件後採納。
+ - `candidate`：已結案但缺乏實體證據，僅供參考。
+ - `avoid`：排除路徑 / 負向知識 / 廢棄方案，**主動避開**。
+ - `superseded`：方案已過期被新單取代，提示改查新單。
+ - `reference_only`：排查中草稿。
 
-### 2. 🔍 Token 級 Hybrid 檢索與同義詞/繁簡擴充
+### 2. Token 級 Hybrid 檢索與同義詞/繁簡擴充
 - **同義詞與縮寫映射**：查詢 `蓝屏` 自動擴充匹配 `藍屏` 與 `bsod`；`睡眠` 自動擴充 `s3` 與 `sleep`。
 - **倒序詞與子路徑容錯**：查詢 `I2C 重設` 能完美召回 `強制重設 I2C 控制器暫存器`；查詢 `_PTS` 能命中 `\_SB.PCI0._PTS`。
 
-### 3. 🎯 真正生效的環境與平台過濾 (`--platform` / `--env`)
+### 3. 真正生效的環境與平台過濾 (`--platform` / `--env`)
 - 在 `answer` 指令中精確過濾硬體平台與執行環境（檢查 `custom_values`、`scope` 與 `conditions`），杜絕硬體/BIOS Agent 誤用異質架構 Workaround。
 
-### 4. 🪶 低 Token 決策封包 (`get --agent`)
+### 4. 低 Token 決策封包 (`get --agent`)
 - 專為小模型有限 Context Window 設計，自動剔除大量冗長歷史 Notes，僅回傳核心解法、Commit 證據與 Do Not Try 禁忌清單，節省 80% 以上 Token。
 
 ---
 
-## 💻 CLI 指令操作手冊 (CLI Quick Start)
+## CLI 指令操作手冊 (CLI Quick Start)
 
 ### 1. Agent 專屬推理證據卡 (`answer` / `card`)
 ```bash
@@ -104,9 +104,9 @@ An industrial-grade, **Failure-Aware, Evidence-Grounded** episodic project memor
 
 ---
 
-## ✨ Core Features for Small Models
+## Core Features for Small Models
 
-1. 🎴 **Unambiguous `decision` Field**: Eliminates reasoning overhead for 7B/14B models with direct action indicators (`adopt`, `adopt_after_check`, `candidate`, `avoid`, `superseded`).
-2. 🔍 **Token-Level Hybrid Search & Synonyms**: Automatic Simplified/Traditional Chinese mapping (`蓝屏` $\leftrightarrow$ `藍屏` $\leftrightarrow$ `bsod`), acronym expansion, and inverted word matching (`I2C 重設` $\rightarrow$ `強制重設 I2C 控制器暫存器`).
-3. 🎯 **True Platform & Environment Filtering**: Filters by `--platform` and `--env` in `answer` to prevent applying mismatched firmware/hardware workarounds.
-4. 🪶 **Low-Token Decision Packet (`get --agent`)**: Strips verbose journal history and provides concise 3-note summaries with commit proofs and Do Not Try constraints.
+1. **Unambiguous `decision` Field**: Eliminates reasoning overhead for 7B/14B models with direct action indicators (`adopt`, `adopt_after_check`, `candidate`, `avoid`, `superseded`).
+2. **Token-Level Hybrid Search & Synonyms**: Automatic Simplified/Traditional Chinese mapping (`蓝屏` $\leftrightarrow$ `藍屏` $\leftrightarrow$ `bsod`), acronym expansion, and inverted word matching (`I2C 重設` $\rightarrow$ `強制重設 I2C 控制器暫存器`).
+3. **True Platform & Environment Filtering**: Filters by `--platform` and `--env` in `answer` to prevent applying mismatched firmware/hardware workarounds.
+4. **Low-Token Decision Packet (`get --agent`)**: Strips verbose journal history and provides concise 3-note summaries with commit proofs and Do Not Try constraints.
