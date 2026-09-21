@@ -1,7 +1,7 @@
 ---
 name: project-memory
-description: "Use for engineering debug: recall cases and reject-paths."
-version: 3.2.2
+description: "Before starting or retrying any BIOS/UEFI, platform-hardware, or firmware engineering debug, recall verified cases + known-bad paths (negative knowledge) so a past failure isn't repeated. Load on ANY such debug or before concluding a root cause: the topic examples (S3/S4 sleep, ACPI, USB, power, GPU, EC/GPIO, SPI) only aid recall — they are NOT the gate."
+version: 3.3.0
 author: Barnet Wang
 license: Apache-2.0
 ---
@@ -81,13 +81,21 @@ python scripts/memory_manager.py note --id 1 --notes "During S3 resume, the Type
 python scripts/memory_manager.py reject-path --id 1 --approach "forced reset of the I2C controller register" --reason "put the power-management chip into protection mode" --failure-mode "system lost power and rebooted" --side-effect "fans spun at full speed and RTC time was lost" --scope "platform=Intel-ARL"
 ```
 
-### 4. Closure & highest-confidence verification (`close` / `verify`)
+### 2. Closure & highest-confidence verification (`close` / `verify`)
 ```bash
 # Close the ticket
 python scripts/memory_manager.py close --id 1 --root-cause "race between Type-C PD firmware and the BIOS ACPI method" --solution "add a 50ms delay in _PTS and wait for the PD state to be ready" --conditions "only for PD firmware >= v2.0" --commit-hash "9f8e7d6c5b4a"
 
-# Promote to Verified
-python scripts/memory_manager.py verify --id 1 --commit-hash "9f8e7d6c5b4a" --evidence-type "test" --evidence-ref "pytest tests/power/test_s3.py" --evidence-note "passed 100 S3 stress cycles"
+# Promote to Verified — two pitfalls:
+#   1. commit verification runs `git` in the CURRENT directory, so cd into
+#      the repo that contains the commit first (VALIDATION_ERROR otherwise).
+#   2. --db path is cwd-relative; pass an ABSOLUTE path when running from
+#      outside the skills dir (NOT_FOUND otherwise).
+cd /path/to/repo && python /abs/path/to/scripts/memory_manager.py verify \
+  --db /abs/path/to/memory.db --id 1 \
+  --commit-hash "9f8e7d6c5b4a" \
+  --evidence-type "test" --evidence-ref "pytest tests/power/test_s3.py" \
+  --evidence-note "passed 100 S3 stress cycles"
 ```
 
 ### 5. Two-stage retrieval (`search` / `search-invalid` / `get --agent`)

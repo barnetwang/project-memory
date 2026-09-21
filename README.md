@@ -2,7 +2,14 @@
 
 ---
 
-<h1 id="繁體中文">Agent Episodic Engineering Memory (v3.1.0)</h1>
+<h1 id="繁體中文">Agent Episodic Engineering Memory (v3.3.0)</h1>
+
+> **v3.3.0 (2026-09-20) Project-Affinity Retrieval**
+> - `--project` 過濾放鬆：完整字串相等 + 部分名包含（`FireRange` 可圈住 `FireRange-AM66ZJ`），三處入口（`search` / `answer` / `search-invalid`）。
+> - `answer` ranking 將 project 命中置於 confidence 之前（≥3 字元 token），本專案工單優先、異域工單只補位。
+> - Cross-project 誠實閘：查詢 token 指向某專案但最佳命中來自其他專案時，`decision` 降為 `candidate` 並附警示，避免跨專案 confident `adopt`。
+> 建議 in-scope debug 一律帶 `--project`，確保證據卡鎖定本專案。
+>
 
 一個專為 AI Coding / Engineering Agent（特別針對 **7B / 14B 本地端開源小模型** 與 **繁簡中文/英文/ACPI 路徑混合環境**）設計的 **Failure-Aware, Evidence-Grounded** 結構化專案長期記憶中樞。
 
@@ -98,7 +105,14 @@ python scripts/memory_manager.py reindex
 
 ---
 
-<h1 id="english">Agent Episodic Engineering Memory (v3.1.0)</h1>
+<h1 id="english">Agent Episodic Engineering Memory (v3.3.0)</h1>
+
+> **v3.3.0 (2026-09-20) Project-Affinity Retrieval**
+> - Relaxed `--project` filter: exact match + substring containment (across `search` / `answer` / `search-invalid`).
+> - `answer` ranking: project-token hits (>=3 chars) outrank content tokens, so same-project tickets stay on top.
+> - Cross-project honesty gate: when query tokens name a project but the top hit comes from another one, `decision` degrades to `candidate` plus a warning.
+> Recommended practice: pass `--project` on in-scope debugging to pin the evidence card to your project.
+>
 
 An industrial-grade, **Failure-Aware, Evidence-Grounded** episodic project memory hub designed specifically for local open-source models (7B / 14B) in mixed Chinese/English/Hardware environments.
 

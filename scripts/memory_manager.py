@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Failure-Aware, Evidence-Grounded Episodic Engineering Memory for AI Agents
-Version 3.0.0 (Industrial Grade & Security Hardened)
+Version 3.3.0 (Project-Affinity Retrieval: relaxed project filter, project outranks content, cross-project honesty gate)
 """
 
 import sqlite3
@@ -1052,8 +1052,12 @@ def search_issues(project=None, query=None, status=None, tracker=None, confidenc
     params = []
 
     if project:
-        where_clauses.append("LOWER(REPLACE(TRIM(i.project_name), ' ', '')) = LOWER(REPLACE(TRIM(?), ' ', ''))")
-        params.append(project)
+        # v3.3.0: relaxed project matching (exact > substring) so a partial
+        # project name ('FireRange') still scopes to 'FireRange-AM66ZJ'.
+        _pn = "LOWER(REPLACE(TRIM(i.project_name), ' ', ''))"
+        _pv = "LOWER(REPLACE(TRIM(?), ' ', ''))"
+        where_clauses.append(f"({_pn} = {_pv} OR {_pn} LIKE ?)")
+        params.extend([project, "%" + project.strip().lower().replace(" ", "") + "%"])
 
     if status:
         where_clauses.append("LOWER(TRIM(i.status)) = LOWER(TRIM(?))")
@@ -1251,8 +1255,12 @@ def search_invalid_paths(query=None, project=None, limit=10, db_path=None, prett
     params = []
 
     if project:
-        where_clauses.append("LOWER(REPLACE(TRIM(i.project_name), ' ', '')) = LOWER(REPLACE(TRIM(?), ' ', ''))")
-        params.append(project)
+        # v3.3.0: relaxed project matching (exact > substring) so a partial
+        # project name ('FireRange') still scopes to 'FireRange-AM66ZJ'.
+        _pn = "LOWER(REPLACE(TRIM(i.project_name), ' ', ''))"
+        _pv = "LOWER(REPLACE(TRIM(?), ' ', ''))"
+        where_clauses.append(f"({_pn} = {_pv} OR {_pn} LIKE ?)")
+        params.extend([project, "%" + project.strip().lower().replace(" ", "") + "%"])
 
     if query and query.strip():
         tokens = extract_search_tokens(query)
@@ -1777,8 +1785,12 @@ def answer_query(query, project=None, platform=None, env=None, limit=3, db_path=
     params = []
 
     if project:
-        where_clauses.append("LOWER(REPLACE(TRIM(i.project_name), ' ', '')) = LOWER(REPLACE(TRIM(?), ' ', ''))")
-        params.append(project)
+        # v3.3.0: relaxed project matching (exact > substring) so a partial
+        # project name ('FireRange') still scopes to 'FireRange-AM66ZJ'.
+        _pn = "LOWER(REPLACE(TRIM(i.project_name), ' ', ''))"
+        _pv = "LOWER(REPLACE(TRIM(?), ' ', ''))"
+        where_clauses.append(f"({_pn} = {_pv} OR {_pn} LIKE ?)")
+        params.extend([project, "%" + project.strip().lower().replace(" ", "") + "%"])
 
     # Platform 過濾
     if platform:
@@ -1845,6 +1857,48 @@ def answer_query(query, project=None, platform=None, env=None, limit=3, db_path=
         """)
         token_params.extend([t_like, t_like, t_like, t_like, t_like, t_like])
 
+    # 3. Rank by token hit-count first: a ticket matching MORE query tokens
+    #    outranks one matching fewer. Previously ties fell through to
+    #    updated_at, letting a newer-but-unrelated issue win the evidence card.
+    rank_clauses = []
+    rank_params = []
+    _rlike = "%" + escape_sql_like(query.strip()) + "%"
+    rank_clauses.append(
+        "(i.subject LIKE ? ESCAPE '\\' OR i.root_cause LIKE ? ESCAPE '\\' "
+        "OR i.solution LIKE ? ESCAPE '\\' OR i.ai_summary LIKE ? ESCAPE '\\')"
+    )
+    rank_params.extend([_rlike, _rlike, _rlike, _rlike])
+    for token in search_tokens:
+        _tl = "%" + escape_sql_like(token) + "%"
+        rank_clauses.append(
+            "(i.subject LIKE ? ESCAPE '\\' OR i.root_cause LIKE ? ESCAPE '\\' "
+            "OR i.solution LIKE ? ESCAPE '\\' OR i.ai_summary LIKE ? ESCAPE '\\' "
+            "OR EXISTS (SELECT 1 FROM invalid_paths ip WHERE ip.issue_id = i.id "
+            "AND (ip.approach LIKE ? ESCAPE '\\' OR ip.reason LIKE ? ESCAPE '\\')))"
+        )
+        rank_params.extend([_tl] * 6)
+    rank_sum = " + ".join(
+        "CASE WHEN " + c + " THEN 1 ELSE 0 END" for c in rank_clauses
+    )
+
+    # v3.3.0: project affinity — a query token hitting a ticket's project_name
+    # outranks pure content hits, so same-project tickets stay on top while
+    # cross-project results only fill the gaps. Single-char tokens are skipped
+    # to prevent false project matches.
+    project_rank_clauses = []
+    project_rank_params = []
+    for token in search_tokens:
+        if len(token) < 3:
+            continue
+        project_rank_clauses.append("(i.project_name LIKE ? ESCAPE '\\')")
+        project_rank_params.append("%" + escape_sql_like(token) + "%")
+    project_sum = (
+        " + ".join(
+            "CASE WHEN " + c + " THEN 1 ELSE 0 END"
+            for c in project_rank_clauses
+        ) if project_rank_clauses else "0"
+    )
+
     where_clauses.append(f"({' OR '.join(token_or_clauses)})")
     params.extend(token_params)
 
@@ -1858,14 +1912,25 @@ def answer_query(query, project=None, platform=None, env=None, limit=3, db_path=
         WHERE {where_str}
         ORDER BY
             CASE WHEN i.superseded_by IS NOT NULL THEN 1 ELSE 0 END ASC,
+            ({project_sum}) DESC,
             CASE i.confidence WHEN 'verified' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC,
+            ({rank_sum}) DESC,
             CASE WHEN i.subject LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END ASC,
             i.updated_at DESC
         LIMIT ?
     '''
-    params.extend([raw_like, limit])
+    params.extend(project_rank_params + rank_params + [raw_like, limit])
     cursor.execute(sql, params)
     candidate_rows = cursor.fetchall()
+
+    # v3.3.0: project probe for the cross-project honesty warning (below).
+    probe_tokens = [t for t in search_tokens if len(t) >= 3]
+    probe_projects = set()
+    if probe_tokens:
+        _pph = " OR ".join(["i2.project_name LIKE ? ESCAPE '\\'" for _ in probe_tokens])
+        _plt = ["%" + escape_sql_like(t) + "%" for t in probe_tokens]
+        cursor.execute(f"SELECT DISTINCT project_name FROM issues i2 WHERE {_pph}", _plt)
+        probe_projects = {r[0].strip().lower().replace(" ", "") for r in cursor.fetchall()}
 
     # 2. 檢索相關負向知識 (Invalid Paths: 採用 Token 拆解 OR 匹配)
     inv_or_clauses = [
@@ -1932,12 +1997,26 @@ def answer_query(query, project=None, platform=None, env=None, limit=3, db_path=
 
     best_sol = solutions[0] if solutions else None
     warnings = []
-    
+
     if best_sol:
         if best_sol.get("superseded_by"):
             warnings.append(f"工單 #{best_sol['issue_id']} 已被工單 #{best_sol['superseded_by']} 取代，建議優先查閱 #{best_sol['superseded_by']}。")
         if best_sol.get("conditions") and best_sol["conditions"] != "無特定限制":
             warnings.append(f"適用條件限制: {best_sol['conditions']}")
+
+    # v3.3.0: cross-project honesty gate. When query tokens identify a project
+    # and the top result comes from a DIFFERENT project, do not issue a
+    # confident `adopt` on a foreign ticket — mark it `candidate` and warn.
+    # (Same-project tokens already outrank via project_sum; this only bites
+    # when the query's own project has nothing the query matches.)
+    if (probe_projects and best_sol
+            and best_sol.get("project", "").strip().lower().replace(" ", "")
+            not in probe_projects):
+        best_sol["decision"] = "candidate"
+        warnings.append(
+            f"注意: 最佳命中來自跨專案 ({best_sol['project']})，非查詢所屬專案 "
+            f"(疑似: {', '.join(sorted(probe_projects))})，採前請核對適用條件。"
+        )
 
     recommendation = f"採用工單 #{best_sol['issue_id']} 之驗證解法: {best_sol['solution']}" if best_sol else "未檢索到已驗證之高置信度解法，建議依標準除錯流程排查。"
 
@@ -2139,7 +2218,7 @@ def main():
     inv_p.add_argument('--approach', required=True, help="嘗試的方法或架構 (例如: In-memory lock)")
     inv_p.add_argument('--reason', required=True, help="失敗原因 (例如: 無法跨實例同步)")
     inv_p.add_argument('--failure-mode', default="", help="失效模式 (例如: 競態條件引發 401)")
-    inv_p.add_argument('--side-effect', default="", help="引發之副作用 (例如: CPU 100% 滿載)")
+    inv_p.add_argument('--side-effect', default="", help="引發之副作用 (例如: CPU 100％ 滿載)")
     inv_p.add_argument('--scope', default="", help="生效範疇 (例如: multi-instance load balancer)")
 
     # 4. close / resolve 指令
