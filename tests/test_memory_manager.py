@@ -324,7 +324,297 @@ class TestHardenedEpisodicMemoryManagerV31(unittest.TestCase):
         self.assertIn("projects_distribution", data)
         self.assertIn("status_distribution", data)
         self.assertIn("confidence_distribution", data)
+        self.assertIn("risk_distribution", data)
         self.assertIn(data["status"], ["healthy", "warning"])
+
+    def test_exploration_tree_and_risk_levels(self):
+        res = self.run_cli(["create", "--project", "TreeTest", "--subject", "ACPI Sleep Hang"])
+        self.assertEqual(res.returncode, 0)
+        issue_id = json.loads(res.stdout)["issue_id"]
+
+        # 1. 建立父節點 (Probe, Medium risk)
+        res_p = self.run_cli([
+            "reject-path", "--id", str(issue_id),
+            "--approach", "讀取 EC 暫存器狀態",
+            "--reason", "EC 韌體未回傳 ACK",
+            "--branch-type", "probe",
+            "--risk-level", "medium"
+        ])
+        self.assertEqual(res_p.returncode, 0)
+        p_data = json.loads(res_p.stdout)
+        parent_path_id = p_data["invalid_path_id"]
+
+        # 2. 建立子節點 (Fix Attempt, Fatal risk)
+        res_c = self.run_cli([
+            "reject-path", "--id", str(issue_id),
+            "--approach", "強制拉低 EC RESET 針腳",
+            "--reason", "導致主機板 PMIC 進入保護模式斷電",
+            "--side-effect", "系統斷電且遺失 RTC",
+            "--parent-id", str(parent_path_id),
+            "--branch-type", "fix_attempt",
+            "--risk-level", "fatal"
+        ])
+        self.assertEqual(res_c.returncode, 0)
+        c_data = json.loads(res_c.stdout)
+        self.assertEqual(c_data["parent_path_id"], parent_path_id)
+        self.assertEqual(c_data["risk_level"], "fatal")
+        self.assertTrue(c_data["veto"])
+
+        # 3. 測試指向不存在的 parent-id 應報錯
+        res_bad_parent = self.run_cli([
+            "reject-path", "--id", str(issue_id),
+            "--approach", "無效父節點測試",
+            "--reason", "測試防呆",
+            "--parent-id", "99999"
+        ])
+        self.assertEqual(res_bad_parent.returncode, 1)
+
+        # 4. 驗證 get 包含完整探索樹屬性
+        res_get = self.run_cli(["get", "--id", str(issue_id)])
+        get_data = json.loads(res_get.stdout)
+        invs = get_data["invalid_paths"]
+        self.assertEqual(len(invs), 2)
+        self.assertEqual(invs[1]["parent_path_id"], parent_path_id)
+        self.assertEqual(invs[1]["branch_type"], "fix_attempt")
+        self.assertEqual(invs[1]["risk_level"], "fatal")
+        self.assertTrue(invs[1]["veto"])
+
+        # 5. 驗證 search-invalid 結果 fatal 置頂且帶有 veto 標籤
+        res_search_inv = self.run_cli(["search-invalid", "--query", "EC"])
+        inv_results = json.loads(res_search_inv.stdout)
+        self.assertGreaterEqual(len(inv_results), 2)
+        self.assertEqual(inv_results[0]["risk_level"], "fatal")
+        self.assertTrue(inv_results[0]["veto"])
+
+    def test_answer_diagnostic_policy_and_veto_prioritization(self):
+        res = self.run_cli([
+            "create", "--project", "KernelPower", "--subject", "S3 Hang On Wakeup",
+            "--root-cause", "PD 韌體競態", "--solution", "延遲 50ms 後重試",
+            "--status", "Resolved"
+        ])
+        issue_id = json.loads(res.stdout)["issue_id"]
+        self.run_cli(["verify", "--id", str(issue_id), "--evidence-ref", "https://ci.example.com/s3_pass"])
+        self.run_cli(["note", "--id", str(issue_id), "--notes", "診斷步驟 1: 檢查 PD 狀態旗標"])
+        self.run_cli(["note", "--id", str(issue_id), "--notes", "診斷步驟 2: 套用 50ms 延遲等待就緒"])
+
+        # 加入一個 low risk 與一個 fatal risk 排除路徑
+        self.run_cli([
+            "reject-path", "--id", str(issue_id),
+            "--approach", "修改編譯器優化選項 -O0",
+            "--reason", "代碼體積過大無法寫入 flash",
+            "--risk-level", "low"
+        ])
+        self.run_cli([
+            "reject-path", "--id", str(issue_id),
+            "--approach", "直寫 I2C 控制器暫存器",
+            "--reason", "PMIC 觸發過流保護斷電",
+            "--side-effect", "主機瞬間跳電",
+            "--risk-level", "fatal"
+        ])
+
+        # 執行 answer
+        res_ans = self.run_cli(["answer", "--query", "S3 Hang", "--project", "KernelPower"])
+        self.assertEqual(res_ans.returncode, 0)
+        card = json.loads(res_ans.stdout)
+
+        # 檢查 do_not_try 中 fatal 項目優先置頂並標註 HARD VETO
+        self.assertGreaterEqual(len(card["do_not_try"]), 2)
+        top_inv = card["do_not_try"][0]
+        self.assertEqual(top_inv["risk_level"], "fatal")
+        self.assertTrue(top_inv["veto"])
+        self.assertIn("[HARD VETO]", top_inv["warning_label"])
+
+        # 檢查 diagnostic_policy 排查狀態機引導
+        self.assertIn("diagnostic_policy", card)
+        diag = card["diagnostic_policy"]
+        self.assertIsNotNone(diag)
+        self.assertEqual(diag["source_issue_id"], issue_id)
+        self.assertEqual(len(diag["recommended_sop"]), 2)
+        self.assertIn("診斷步驟 1", diag["recommended_sop"][0])
+        self.assertGreaterEqual(len(diag["pruned_branches"]), 2)
+        self.assertEqual(len(diag["verification_checks"]), 1)
+
+    def test_dream_offline_policy_synthesis(self):
+        res = self.run_cli([
+            "create", "--project", "DreamProj", "--subject", "DRAM Timing Instability",
+            "--root-cause", "記憶體訓練電壓不足", "--solution", "調高 VDDQ 50mV",
+            "--status", "Resolved"
+        ])
+        issue_id = json.loads(res.stdout)["issue_id"]
+        self.run_cli(["verify", "--id", str(issue_id), "--evidence-ref", "https://ci.example.com/mem_test_ok"])
+        self.run_cli([
+            "reject-path", "--id", str(issue_id),
+            "--approach", "直接關閉 ECC 檢查",
+            "--reason", "導致靜默資料損壞 (Silent Data Corruption)",
+            "--risk-level", "fatal"
+        ])
+
+        # 1. 執行 dream 產出 JSON
+        res_dream = self.run_cli(["dream", "--project", "DreamProj"])
+        self.assertEqual(res_dream.returncode, 0)
+        data = json.loads(res_dream.stdout)
+        self.assertEqual(data["status"], "success")
+        self.assertIn("hard_veto_rules", data)
+        self.assertEqual(len(data["hard_veto_rules"]), 1)
+        self.assertEqual(data["hard_veto_rules"][0]["approach"], "直接關閉 ECC 檢查")
+        self.assertEqual(data["risk_distribution"]["fatal"], 1)
+
+        # 2. 測試 dream 輸出 Markdown 規則檔案
+        rules_path = os.path.join(self.temp_dir.name, "dream_rules.md")
+        res_md = self.run_cli(["dream", "--project", "DreamProj", "--output-rules", rules_path])
+        self.assertEqual(res_md.returncode, 0)
+        self.assertTrue(os.path.exists(rules_path))
+        with open(rules_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("Project Memory Exploration Policy", content)
+        self.assertIn("HARD VETO Rules", content)
+        self.assertIn("直接關閉 ECC 檢查", content)
+
+    def test_v3_schema_migration_on_upgrade(self):
+        # 模擬升級場景：手工建立一個 v3 形狀的資料庫 (invalid_paths 無
+        # parent_path_id / branch_type / risk_level，user_version=3)，
+        # 任一讀指令觸發 init_db 後必須完成 v4 遷移且資料不損。
+        v3_path = os.path.join(self.temp_dir.name, "legacy_v3.db")
+        import sqlite3
+        conn = sqlite3.connect(v3_path)
+        conn.executescript('''
+            CREATE TABLE issues (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_name TEXT NOT NULL,
+                tracker TEXT NOT NULL DEFAULT 'Bug',
+                status TEXT NOT NULL DEFAULT 'New',
+                priority TEXT NOT NULL DEFAULT 'Normal',
+                confidence TEXT NOT NULL DEFAULT 'unverified',
+                subject TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                scope TEXT DEFAULT '', conditions TEXT DEFAULT '',
+                root_cause TEXT DEFAULT '', solution TEXT DEFAULT '',
+                ai_summary TEXT DEFAULT '', related_ids TEXT DEFAULT '',
+                superseded_by INTEGER, created_by TEXT DEFAULT 'Agent',
+                verified_by TEXT DEFAULT '', verified_at DATETIME,
+                created_at DATETIME, updated_at DATETIME, closed_at DATETIME
+            );
+            CREATE TABLE journals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+                notes TEXT NOT NULL, author TEXT DEFAULT 'Agent', created_at DATETIME
+            );
+            CREATE TABLE invalid_paths (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+                approach TEXT NOT NULL, failure_mode TEXT DEFAULT '',
+                reason TEXT NOT NULL, side_effect TEXT DEFAULT '',
+                scope TEXT DEFAULT '', created_at DATETIME
+            );
+            CREATE TABLE evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+                evidence_type TEXT NOT NULL, reference TEXT NOT NULL,
+                note TEXT DEFAULT '', created_at DATETIME
+            );
+            CREATE TABLE custom_fields (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL, field_type TEXT DEFAULT 'string'
+            );
+            CREATE TABLE custom_values (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+                custom_field_id INTEGER NOT NULL REFERENCES custom_fields(id) ON DELETE CASCADE,
+                value TEXT NOT NULL, UNIQUE(issue_id, custom_field_id)
+            );
+            CREATE TABLE git_revisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+                commit_hash TEXT NOT NULL, repository TEXT DEFAULT '',
+                diff_summary TEXT DEFAULT '', created_at DATETIME
+            );
+            INSERT INTO issues (project_name, subject, status, created_at, updated_at)
+            VALUES ('LegacyProj', 'S3 sleep hang on legacy board', 'Closed',
+                    '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z');
+            INSERT INTO invalid_paths (issue_id, approach, reason, created_at)
+            VALUES (1, 'force reset I2C controller', 'PMIC entered protection mode',
+                    '2026-01-02T00:00:00Z');
+            PRAGMA user_version = 3;
+        ''')
+        conn.close()
+
+        v3_env = self.env.copy()
+        v3_env["PROJECT_MEMORY_DB"] = v3_path
+
+        # 1. doctor 必須在遷移後成功回傳 (舊版會噴 EXECUTION_ERROR:
+        #    no such column: parent_path_id 且把 DB 留在半遷移狀態)
+        res = self.run_cli(["doctor"], custom_env=v3_env)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        data = json.loads(res.stdout)
+        self.assertIn(data["status"], ["healthy", "warning"])
+
+        # 2. 遷移完成：schema v4、新欄位到位且舊資料補預設值
+        conn = sqlite3.connect(v3_path)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(invalid_paths)")}
+        self.assertIn("parent_path_id", cols)
+        self.assertIn("branch_type", cols)
+        self.assertIn("risk_level", cols)
+        risk, branch = conn.execute(
+            "SELECT risk_level, branch_type FROM invalid_paths WHERE id = 1").fetchone()
+        self.assertEqual(risk, "medium")
+        self.assertEqual(branch, "attempt")
+        # 3. 舊資料完整保留
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM issues").fetchone()[0], 1)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM invalid_paths").fetchone()[0], 1)
+        conn.close()
+
+        # 4. 遷移後檢索功能照常 (FTS 已重建)
+        res_inv = self.run_cli(["search-invalid", "--query", "I2C"], custom_env=v3_env)
+        self.assertEqual(res_inv.returncode, 0)
+        items = json.loads(res_inv.stdout)
+        self.assertGreaterEqual(len(items), 1)
+        self.assertEqual(items[0]["risk_level"], "medium")
+
+    def test_export_import_with_exploration_tree(self):
+        res = self.run_cli(["create", "--project", "ExportTreeProj", "--subject", "Tree Export Issue"])
+        issue_id = json.loads(res.stdout)["issue_id"]
+        res_p = self.run_cli([
+            "reject-path", "--id", str(issue_id),
+            "--approach", "父方法",
+            "--reason", "父原因",
+            "--branch-type", "hypothesis",
+            "--risk-level", "medium"
+        ])
+        parent_id = json.loads(res_p.stdout)["invalid_path_id"]
+
+        res_c = self.run_cli([
+            "reject-path", "--id", str(issue_id),
+            "--approach", "子方法",
+            "--reason", "子原因",
+            "--parent-id", str(parent_id),
+            "--branch-type", "fix_attempt",
+            "--risk-level", "high"
+        ])
+
+        # 匯出到 jsonl
+        export_file = os.path.join(self.temp_dir.name, "tree_export.jsonl")
+        res_exp = self.run_cli(["export", "--file", export_file])
+        self.assertEqual(res_exp.returncode, 0)
+
+        # 建立全新的 test db 並匯入
+        new_db_path = os.path.join(self.temp_dir.name, "new_tree.db")
+        new_env = self.env.copy()
+        new_env["PROJECT_MEMORY_DB"] = new_db_path
+
+        res_imp = self.run_cli(["import", "--file", export_file], custom_env=new_env)
+        self.assertEqual(res_imp.returncode, 0)
+
+        # 檢查匯入後的新資料庫中，子節點的 parent_path_id 是否正確重映射
+        res_get = self.run_cli(["get", "--id", "1"], custom_env=new_env)
+        imported_issue = json.loads(res_get.stdout)
+        invs = imported_issue["invalid_paths"]
+        self.assertEqual(len(invs), 2)
+        self.assertEqual(invs[1]["parent_path_id"], invs[0]["id"])
+        self.assertEqual(invs[1]["risk_level"], "high")
+        self.assertTrue(invs[1]["veto"])
 
 if __name__ == '__main__':
     unittest.main()

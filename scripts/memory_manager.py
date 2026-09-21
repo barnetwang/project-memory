@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Failure-Aware, Evidence-Grounded Episodic Engineering Memory for AI Agents
-Version 3.3.0 (Project-Affinity Retrieval: relaxed project filter, project outranks content, cross-project honesty gate)
+Version 3.4.0 (Dream-RSI: Exploration Trees, Risk-Aware Pruning, Offline Dreaming & Policy Guided Search)
 """
 
 import sqlite3
@@ -21,7 +21,10 @@ if sys.stdout.encoding is None or sys.stdout.encoding.lower() != 'utf-8':
     except AttributeError:
         pass
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+ALLOWED_BRANCH_TYPES = {"hypothesis", "probe", "workaround", "fix_attempt", "attempt"}
+ALLOWED_RISK_LEVELS = {"fatal", "high", "medium", "low"}
 
 STATUS_ALIASES = {
     "new": "New",
@@ -261,7 +264,7 @@ def init_db(db_path=None):
         )
     ''')
 
-    # 3. 細粒度負向知識表 (Invalid Paths)
+    # 3. 細粒度負向知識表 (Invalid Paths - 支援探索樹與風險權重)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS invalid_paths (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -271,6 +274,9 @@ def init_db(db_path=None):
             reason TEXT NOT NULL,
             side_effect TEXT DEFAULT '',
             scope TEXT DEFAULT '',
+            parent_path_id INTEGER DEFAULT NULL REFERENCES invalid_paths(id) ON DELETE SET NULL,
+            branch_type TEXT DEFAULT 'attempt',
+            risk_level TEXT DEFAULT 'medium',
             created_at DATETIME
         )
     ''')
@@ -324,6 +330,9 @@ def init_db(db_path=None):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_issues_confidence ON issues(confidence)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_journals_issue ON journals(issue_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_invalid_paths_issue ON invalid_paths(issue_id)")
+    # v4: idx_invalid_paths_parent / idx_invalid_paths_risk are created AFTER the
+    # ALTER TABLE migration below adds those columns; building them first would
+    # throw "no such column" and abort the entire migration on v3 databases.
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_evidence_issue ON evidence(issue_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_custom_values_issue ON custom_values(issue_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_git_revisions_issue ON git_revisions(issue_id)")
@@ -336,6 +345,19 @@ def init_db(db_path=None):
     cursor.execute("PRAGMA user_version")
     current_ver = cursor.fetchone()[0]
     best_tokenizer = detect_best_tokenizer(conn)
+
+    # v4 migration: 確保既有 invalid_paths 表含有 parent_path_id, branch_type, risk_level 欄位
+    cursor.execute("PRAGMA table_info(invalid_paths)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+    if "parent_path_id" not in existing_cols:
+        cursor.execute("ALTER TABLE invalid_paths ADD COLUMN parent_path_id INTEGER DEFAULT NULL REFERENCES invalid_paths(id) ON DELETE SET NULL")
+    if "branch_type" not in existing_cols:
+        cursor.execute("ALTER TABLE invalid_paths ADD COLUMN branch_type TEXT DEFAULT 'attempt'")
+    if "risk_level" not in existing_cols:
+        cursor.execute("ALTER TABLE invalid_paths ADD COLUMN risk_level TEXT DEFAULT 'medium'")
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_invalid_paths_parent ON invalid_paths(parent_path_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_invalid_paths_risk ON invalid_paths(risk_level)")
 
     if current_ver < SCHEMA_VERSION:
         cursor.execute("DROP TABLE IF EXISTS issues_fts")
@@ -370,8 +392,8 @@ def sync_fts_entry(conn, issue_id):
     cursor.execute("SELECT notes FROM journals WHERE issue_id = ? ORDER BY id ASC", (issue_id,))
     notes_aggregate = "\n".join([row[0] for row in cursor.fetchall()])
 
-    cursor.execute("SELECT approach, failure_mode, reason, side_effect, scope FROM invalid_paths WHERE issue_id = ? ORDER BY id ASC", (issue_id,))
-    inv_list = [f"無效方法: {r[0]} | 失效模式: {r[1]} | 原因: {r[2]} | 副作用: {r[3]} | 範疇: {r[4]}" for r in cursor.fetchall()]
+    cursor.execute("SELECT approach, failure_mode, reason, side_effect, scope, branch_type, risk_level FROM invalid_paths WHERE issue_id = ? ORDER BY id ASC", (issue_id,))
+    inv_list = [f"無效方法: {r[0]} | 失效模式: {r[1]} | 原因: {r[2]} | 副作用: {r[3]} | 範疇: {r[4]} | 分支: {r[5]} | 風險: {r[6]}" for r in cursor.fetchall()]
     invalid_paths_aggregate = "\n".join(inv_list)
 
     cursor.execute('''
@@ -687,12 +709,21 @@ def add_journal(issue_id, notes, author="Agent", allow_secret=False, db_path=Non
     }, pretty)
 
 def add_invalid_path(issue_id, approach, reason, failure_mode="", side_effect="", scope="",
+                     parent_path_id=None, branch_type="attempt", risk_level="medium",
                      allow_secret=False, db_path=None, pretty=False):
-    """記錄細粒度負向知識 (Invalid Path)"""
+    """記錄細粒度負向知識與探索樹分支 (Invalid Path / Exploration Tree Node)"""
     if not approach or not approach.strip():
         raise ValueError("Approach cannot be empty.")
     if not reason or not reason.strip():
         raise ValueError("Reason cannot be empty.")
+
+    branch_type = (branch_type or "attempt").strip().lower()
+    if branch_type not in ALLOWED_BRANCH_TYPES:
+        raise ValueError(f"Invalid branch_type: '{branch_type}'. Allowed: {', '.join(sorted(ALLOWED_BRANCH_TYPES))}")
+
+    risk_level = (risk_level or "medium").strip().lower()
+    if risk_level not in ALLOWED_RISK_LEVELS:
+        raise ValueError(f"Invalid risk_level: '{risk_level}'. Allowed: {', '.join(sorted(ALLOWED_RISK_LEVELS))}")
 
     collect_and_scan_secrets({
         "approach": approach, "reason": reason, "failure_mode": failure_mode,
@@ -708,11 +739,17 @@ def add_invalid_path(issue_id, approach, reason, failure_mode="", side_effect=""
         output_json({"status": "error", "error_code": "NOT_FOUND", "message": f"Issue #{issue_id} not found."}, pretty)
         sys.exit(1)
 
-    cursor.execute('''
-        INSERT INTO invalid_paths (issue_id, approach, failure_mode, reason, side_effect, scope, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (issue_id, approach.strip(), failure_mode.strip(), reason.strip(), side_effect.strip(), scope.strip(), now))
+    if parent_path_id is not None:
+        cursor.execute("SELECT id FROM invalid_paths WHERE id = ? AND issue_id = ?", (parent_path_id, issue_id))
+        if not cursor.fetchone():
+            raise ValueError(f"Parent invalid path #{parent_path_id} not found for Issue #{issue_id}.")
 
+    cursor.execute('''
+        INSERT INTO invalid_paths (issue_id, approach, failure_mode, reason, side_effect, scope, parent_path_id, branch_type, risk_level, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (issue_id, approach.strip(), failure_mode.strip(), reason.strip(), side_effect.strip(), scope.strip(), parent_path_id, branch_type, risk_level, now))
+
+    path_id = cursor.lastrowid
     cursor.execute("UPDATE issues SET updated_at = ? WHERE id = ?", (now, issue_id))
     
     conn.commit()
@@ -722,9 +759,14 @@ def add_invalid_path(issue_id, approach, reason, failure_mode="", side_effect=""
 
     output_json({
         "status": "success",
-        "message": f"Recorded negative knowledge (invalid path) for Issue #{issue_id}.",
+        "message": f"Recorded negative knowledge (invalid path #{path_id}) for Issue #{issue_id}.",
         "issue_id": issue_id,
-        "approach": approach
+        "invalid_path_id": path_id,
+        "approach": approach,
+        "parent_path_id": parent_path_id,
+        "branch_type": branch_type,
+        "risk_level": risk_level,
+        "veto": risk_level in {"fatal", "high"}
     }, pretty)
 
 def close_issue(issue_id, root_cause, solution, ai_summary="", status="Closed", confidence="",
@@ -880,10 +922,14 @@ def verify_issue(issue_id, commit_hash="", evidence_type="test", evidence_ref=""
     }, pretty)
 
 def reject_issue(issue_id, reason, status="Rejected", side_effect="", scope="",
-                 allow_secret=False, db_path=None, pretty=False):
+                 risk_level="high", allow_secret=False, db_path=None, pretty=False):
     """工單級別拒絕 / 沉澱負向知識，並自動同步至 invalid_paths"""
     if not reason or not reason.strip():
         raise ValueError("Reason cannot be empty when rejecting an issue.")
+
+    risk_level = (risk_level or "high").strip().lower()
+    if risk_level not in ALLOWED_RISK_LEVELS:
+        raise ValueError(f"Invalid risk_level: '{risk_level}'. Allowed: {', '.join(sorted(ALLOWED_RISK_LEVELS))}")
 
     collect_and_scan_secrets({"reason": reason, "side_effect": side_effect, "scope": scope}, allow_secret)
 
@@ -918,9 +964,9 @@ def reject_issue(issue_id, reason, status="Rejected", side_effect="", scope="",
 
     # 自動將工單級別拒絕同步為 invalid_path 條目，確保 search-invalid 查得到
     cursor.execute('''
-        INSERT INTO invalid_paths (issue_id, approach, failure_mode, reason, side_effect, scope, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (issue_id, subject, f"{status} Solution", reason, side_effect, scope, now))
+        INSERT INTO invalid_paths (issue_id, approach, failure_mode, reason, side_effect, scope, parent_path_id, branch_type, risk_level, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, 'hypothesis', ?, ?)
+    ''', (issue_id, subject, f"{status} Solution", reason, side_effect, scope, risk_level, now))
 
     conn.commit()
     sync_fts_entry(conn, issue_id)
@@ -1292,11 +1338,20 @@ def search_invalid_paths(query=None, project=None, limit=10, db_path=None, prett
     where_str = " AND ".join(where_clauses) if where_clauses else "1=1"
     sql = f'''
         SELECT ip.id, ip.issue_id, i.project_name, i.subject as issue_subject,
-               ip.approach, ip.failure_mode, ip.reason, ip.side_effect, ip.scope, ip.created_at
+               ip.approach, ip.failure_mode, ip.reason, ip.side_effect, ip.scope,
+               ip.parent_path_id, ip.branch_type, ip.risk_level, ip.created_at
         FROM invalid_paths ip
         JOIN issues i ON ip.issue_id = i.id
         WHERE {where_str}
-        ORDER BY ip.created_at DESC
+        ORDER BY
+            CASE ip.risk_level
+                WHEN 'fatal' THEN 0
+                WHEN 'high' THEN 1
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 3
+                ELSE 4
+            END ASC,
+            ip.created_at DESC
         LIMIT ?
     '''
     params.append(limit)
@@ -1310,6 +1365,7 @@ def search_invalid_paths(query=None, project=None, limit=10, db_path=None, prett
     for r in rows:
         if r[0] not in seen_ids:
             seen_ids.add(r[0])
+            r_risk = (r[11] or "medium").lower()
             results.append({
                 "invalid_path_id": r[0],
                 "issue_id": r[1],
@@ -1320,7 +1376,11 @@ def search_invalid_paths(query=None, project=None, limit=10, db_path=None, prett
                 "reason": r[6],
                 "side_effect": r[7],
                 "scope": r[8],
-                "created_at": r[9]
+                "parent_path_id": r[9],
+                "branch_type": r[10] or "attempt",
+                "risk_level": r_risk,
+                "veto": r_risk in {"fatal", "high"},
+                "created_at": r[12]
             })
     output_json(results, pretty)
 
@@ -1387,7 +1447,7 @@ def get_issue(issue_id, agent_mode=False, db_path=None, pretty=False):
     ]
 
     cursor.execute('''
-        SELECT id, approach, failure_mode, reason, side_effect, scope, created_at
+        SELECT id, approach, failure_mode, reason, side_effect, scope, parent_path_id, branch_type, risk_level, created_at
         FROM invalid_paths WHERE issue_id = ? ORDER BY id ASC
     ''', (issue_id,))
     invalid_paths = [
@@ -1398,6 +1458,10 @@ def get_issue(issue_id, agent_mode=False, db_path=None, pretty=False):
             "reason": r["reason"],
             "side_effect": r["side_effect"],
             "scope": r["scope"],
+            "parent_path_id": r["parent_path_id"],
+            "branch_type": r["branch_type"] or "attempt",
+            "risk_level": r["risk_level"] or "medium",
+            "veto": (r["risk_level"] or "medium").lower() in {"fatal", "high"},
             "created_at": r["created_at"]
         }
         for r in cursor.fetchall()
@@ -1439,10 +1503,15 @@ def get_issue(issue_id, agent_mode=False, db_path=None, pretty=False):
             "evidence": evidence_list,
             "do_not_try": [
                 {
+                    "path_id": inv["id"],
                     "approach": inv["approach"],
                     "reason": inv["reason"],
                     "side_effect": inv["side_effect"],
-                    "scope": inv["scope"]
+                    "scope": inv["scope"],
+                    "parent_path_id": inv["parent_path_id"],
+                    "branch_type": inv["branch_type"],
+                    "risk_level": inv["risk_level"],
+                    "veto": inv["veto"]
                 }
                 for inv in invalid_paths
             ],
@@ -1602,8 +1671,22 @@ def export_data(file_path, project=None, db_path=None, pretty=False):
             cursor.execute('SELECT evidence_type, reference, note, created_at FROM evidence WHERE issue_id = ?', (i_id,))
             evidence_list = [{"type": r["evidence_type"], "reference": r["reference"], "note": r["note"], "created_at": r["created_at"]} for r in cursor.fetchall()]
 
-            cursor.execute('SELECT approach, failure_mode, reason, side_effect, scope, created_at FROM invalid_paths WHERE issue_id = ?', (i_id,))
-            invalid_paths = [{"approach": r["approach"], "failure_mode": r["failure_mode"], "reason": r["reason"], "side_effect": r["side_effect"], "scope": r["scope"], "created_at": r["created_at"]} for r in cursor.fetchall()]
+            cursor.execute('SELECT id, approach, failure_mode, reason, side_effect, scope, parent_path_id, branch_type, risk_level, created_at FROM invalid_paths WHERE issue_id = ?', (i_id,))
+            invalid_paths = [
+                {
+                    "id": r["id"],
+                    "approach": r["approach"],
+                    "failure_mode": r["failure_mode"],
+                    "reason": r["reason"],
+                    "side_effect": r["side_effect"],
+                    "scope": r["scope"],
+                    "parent_path_id": r["parent_path_id"],
+                    "branch_type": r["branch_type"] or "attempt",
+                    "risk_level": r["risk_level"] or "medium",
+                    "created_at": r["created_at"]
+                }
+                for r in cursor.fetchall()
+            ]
 
             cursor.execute('SELECT notes, author, created_at FROM journals WHERE issue_id = ?', (i_id,))
             journals = [{"notes": r["notes"], "author": r["author"], "created_at": r["created_at"]} for r in cursor.fetchall()]
@@ -1637,7 +1720,9 @@ def import_data(file_path, dedupe=False, allow_secret=False, db_path=None, prett
     imported_count = 0
     skipped_count = 0
     id_mapping = {}  # 舊 ID -> 新 ID
+    path_id_mapping = {}  # 舊 Path ID -> 新 Path ID
     pending_updates = []
+    pending_path_updates = []
 
     try:
         cursor.execute("BEGIN TRANSACTION")
@@ -1709,9 +1794,25 @@ def import_data(file_path, dedupe=False, allow_secret=False, db_path=None, prett
 
                 for inv in item.get('invalid_paths', []):
                     cursor.execute('''
-                        INSERT INTO invalid_paths (issue_id, approach, failure_mode, reason, side_effect, scope, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', (new_id, inv.get('approach', ''), inv.get('failure_mode', ''), inv.get('reason', ''), inv.get('side_effect', ''), inv.get('scope', ''), inv.get('created_at', utc_now_iso())))
+                        INSERT INTO invalid_paths (issue_id, approach, failure_mode, reason, side_effect, scope, parent_path_id, branch_type, risk_level, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                    ''', (
+                        new_id,
+                        inv.get('approach', ''),
+                        inv.get('failure_mode', ''),
+                        inv.get('reason', ''),
+                        inv.get('side_effect', ''),
+                        inv.get('scope', ''),
+                        inv.get('branch_type', 'attempt'),
+                        inv.get('risk_level', 'medium'),
+                        inv.get('created_at', utc_now_iso())
+                    ))
+                    new_path_id = cursor.lastrowid
+                    old_path_id = inv.get('id')
+                    if old_path_id is not None:
+                        path_id_mapping[old_path_id] = new_path_id
+                    if inv.get('parent_path_id') is not None:
+                        pending_path_updates.append((new_path_id, inv.get('parent_path_id')))
 
                 for j in item.get('journals', []):
                     cursor.execute('INSERT INTO journals (issue_id, notes, author, created_at) VALUES (?, ?, ?, ?)',
@@ -1744,6 +1845,11 @@ def import_data(file_path, dedupe=False, allow_secret=False, db_path=None, prett
             if updates:
                 params.append(new_id)
                 cursor.execute(f"UPDATE issues SET {', '.join(updates)} WHERE id = ?", params)
+
+        # 重新映射 invalid_paths 的 parent_path_id
+        for new_pid, old_parent_pid in pending_path_updates:
+            if old_parent_pid in path_id_mapping:
+                cursor.execute("UPDATE invalid_paths SET parent_path_id = ? WHERE id = ?", (path_id_mapping[old_parent_pid], new_pid))
 
         conn.commit()
 
@@ -1952,16 +2058,24 @@ def answer_query(query, project=None, platform=None, env=None, limit=3, db_path=
         inv_params.extend([t_like, t_like, t_like, t_like, t_like])
 
     inv_sql = f'''
-        SELECT ip.approach, ip.reason, ip.side_effect, ip.scope, ip.issue_id, i.subject
+        SELECT ip.id, ip.approach, ip.reason, ip.side_effect, ip.scope, ip.issue_id, i.subject,
+               ip.parent_path_id, ip.branch_type, ip.risk_level
         FROM invalid_paths ip
         JOIN issues i ON ip.issue_id = i.id
         WHERE ({' OR '.join(inv_or_clauses)})
-        ORDER BY ip.created_at DESC
-        LIMIT 5
+        ORDER BY
+            CASE ip.risk_level
+                WHEN 'fatal' THEN 0
+                WHEN 'high' THEN 1
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 3
+                ELSE 4
+            END ASC,
+            ip.created_at DESC
+        LIMIT 10
     '''
     cursor.execute(inv_sql, inv_params)
     inv_rows = cursor.fetchall()
-    conn.close()
 
     solutions = []
     for r in candidate_rows:
@@ -1984,18 +2098,71 @@ def answer_query(query, project=None, platform=None, env=None, limit=3, db_path=
     do_not_try = []
     seen_approaches = set()
     for ir in inv_rows:
-        app_key = ir[0].strip().lower()
+        app_key = ir[1].strip().lower()
         if app_key not in seen_approaches:
             seen_approaches.add(app_key)
+            ir_risk = (ir[9] or "medium").lower()
+            is_veto = ir_risk in {"fatal", "high"}
             do_not_try.append({
-                "approach": ir[0],
-                "reason": ir[1],
-                "side_effect": ir[2] or "",
-                "scope": ir[3] or "",
-                "source_issue_id": ir[4]
+                "path_id": ir[0],
+                "approach": ir[1],
+                "reason": ir[2],
+                "side_effect": ir[3] or "",
+                "scope": ir[4] or "",
+                "source_issue_id": ir[5],
+                "parent_path_id": ir[7],
+                "branch_type": ir[8] or "attempt",
+                "risk_level": ir_risk,
+                "veto": is_veto,
+                "warning_label": f"[HARD VETO] {ir[1]}" if is_veto else ir[1]
             })
 
     best_sol = solutions[0] if solutions else None
+    diagnostic_policy = None
+    if best_sol:
+        b_id = best_sol["issue_id"]
+        cursor.execute("SELECT id, notes, author, created_at FROM journals WHERE issue_id = ? ORDER BY id ASC", (b_id,))
+        b_journals = cursor.fetchall()
+        cursor.execute("SELECT id, approach, failure_mode, reason, side_effect, scope, parent_path_id, branch_type, risk_level FROM invalid_paths WHERE issue_id = ? ORDER BY id ASC", (b_id,))
+        b_invs = cursor.fetchall()
+        cursor.execute("SELECT evidence_type, reference, note FROM evidence WHERE issue_id = ? ORDER BY id ASC", (b_id,))
+        b_evidence = cursor.fetchall()
+
+        sop_steps = []
+        if b_journals:
+            for idx, jr in enumerate(b_journals, 1):
+                sop_steps.append(f"Step {idx}: {jr[1]}")
+        else:
+            if best_sol.get("root_cause"):
+                sop_steps.append(f"Step 1 (Root Cause Check): 診斷確認是否為「{best_sol['root_cause']}」")
+            if best_sol.get("conditions") and best_sol["conditions"] != "無特定限制":
+                sop_steps.append(f"Step 2 (Prerequisite): 確認適用條件「{best_sol['conditions']}」")
+            if best_sol.get("solution"):
+                step_num = len(sop_steps) + 1
+                sop_steps.append(f"Step {step_num} (Execution): 套用驗證解法「{best_sol['solution']}」")
+
+        diagnostic_policy = {
+            "source_issue_id": b_id,
+            "recommended_sop": sop_steps,
+            "pruned_branches": [
+                {
+                    "path_id": binv[0],
+                    "approach": binv[1],
+                    "branch_type": binv[7] or "attempt",
+                    "risk_level": binv[8] or "medium",
+                    "reason": binv[3],
+                    "side_effect": binv[4] or "",
+                    "veto": (binv[8] or "medium").lower() in {"fatal", "high"}
+                }
+                for binv in b_invs
+            ],
+            "verification_checks": [
+                {"type": bev[0], "reference": bev[1], "note": bev[2]} for bev in b_evidence
+            ]
+        }
+
+    conn.close()
+
     warnings = []
 
     if best_sol:
@@ -2026,6 +2193,7 @@ def answer_query(query, project=None, platform=None, env=None, limit=3, db_path=
         "recommendation": recommendation,
         "confidence": best_sol["confidence"] if best_sol else "unverified",
         "best_solution": best_sol,
+        "diagnostic_policy": diagnostic_policy,
         "alternative_solutions": solutions[1:] if len(solutions) > 1 else [],
         "do_not_try": do_not_try,
         "warnings": warnings
@@ -2112,6 +2280,20 @@ def doctor(db_path=None, pretty=False):
     if fts_count < total_issues:
         warnings.append(f"FTS index is out of sync: {total_issues} issues vs {fts_count} FTS entries. Run 'reindex' to fix.")
 
+    # 4. 探索樹風險分佈與懸空父節點檢查
+    cursor.execute("SELECT risk_level, COUNT(*) FROM invalid_paths GROUP BY risk_level")
+    risk_distribution = {r[0] or "medium": r[1] for r in cursor.fetchall()}
+
+    cursor.execute("""
+        SELECT ip1.id, ip1.parent_path_id
+        FROM invalid_paths ip1
+        WHERE ip1.parent_path_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM invalid_paths ip2 WHERE ip2.id = ip1.parent_path_id)
+    """)
+    dangling_parents = cursor.fetchall()
+    if dangling_parents:
+        warnings.append(f"{len(dangling_parents)} invalid path records have dangling parent_path_id references.")
+
     conn.close()
 
     output_json({
@@ -2128,8 +2310,181 @@ def doctor(db_path=None, pretty=False):
         "projects_distribution": projects_distribution,
         "status_distribution": status_distribution,
         "confidence_distribution": confidence_distribution,
+        "risk_distribution": risk_distribution,
         "warnings": warnings
     }, pretty)
+
+def dream_policy(project=None, output_rules=None, format_type="json", db_path=None, pretty=False):
+    """
+    Dream-RSI 離線策略提煉 (Offline Dreaming & Meta-Policy Synthesis)
+    回顧過往成功與失敗的探索歷程樹，提煉專案排查策略 (Heuristics, SOP, Hard Veto Rules)
+    """
+    conn = init_db(db_path)
+    cursor = conn.cursor()
+
+    where_clause = ""
+    params = []
+    if project:
+        _pn = "LOWER(REPLACE(TRIM(i.project_name), ' ', ''))"
+        _pv = "LOWER(REPLACE(TRIM(?), ' ', ''))"
+        where_clause = f"WHERE ({_pn} = {_pv} OR {_pn} LIKE ?)"
+        params = [project, "%" + project.strip().lower().replace(" ", "") + "%"]
+
+    cursor.execute(f"SELECT COUNT(*) FROM issues i {where_clause}", params)
+    total_issues = cursor.fetchone()[0]
+
+    inv_where = ""
+    inv_params = []
+    if project:
+        _pn = "LOWER(REPLACE(TRIM(i.project_name), ' ', ''))"
+        _pv = "LOWER(REPLACE(TRIM(?), ' ', ''))"
+        inv_where = f"WHERE ({_pn} = {_pv} OR {_pn} LIKE ?)"
+        inv_params = [project, "%" + project.strip().lower().replace(" ", "") + "%"]
+
+    cursor.execute(f"""
+        SELECT ip.id, ip.issue_id, i.project_name, i.subject, ip.approach, ip.reason,
+               ip.failure_mode, ip.side_effect, ip.scope, ip.parent_path_id,
+               ip.branch_type, ip.risk_level
+        FROM invalid_paths ip
+        JOIN issues i ON ip.issue_id = i.id
+        {inv_where}
+        ORDER BY
+            CASE ip.risk_level
+                WHEN 'fatal' THEN 0
+                WHEN 'high' THEN 1
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 3
+                ELSE 4
+            END ASC,
+            ip.created_at DESC
+    """, inv_params)
+    inv_rows = cursor.fetchall()
+
+    sol_where = "WHERE i.status IN ('Closed', 'Resolved', 'Verified')"
+    sol_params = []
+    if project:
+        _pn = "LOWER(REPLACE(TRIM(i.project_name), ' ', ''))"
+        _pv = "LOWER(REPLACE(TRIM(?), ' ', ''))"
+        sol_where += f" AND ({_pn} = {_pv} OR {_pn} LIKE ?)"
+        sol_params = [project, "%" + project.strip().lower().replace(" ", "") + "%"]
+
+    cursor.execute(f"""
+        SELECT i.id, i.project_name, i.subject, i.root_cause, i.solution, i.conditions,
+               i.status, i.confidence,
+               (SELECT commit_hash FROM git_revisions WHERE issue_id = i.id ORDER BY id DESC LIMIT 1) as commit_ref
+        FROM issues i
+        {sol_where}
+        ORDER BY
+            CASE i.confidence WHEN 'verified' THEN 0 WHEN 'high' THEN 1 ELSE 2 END ASC,
+            i.updated_at DESC
+    """, sol_params)
+    sol_rows = cursor.fetchall()
+
+    conn.close()
+
+    hard_veto_rules = []
+    risk_stats = {"fatal": 0, "high": 0, "medium": 0, "low": 0}
+    seen_veto = set()
+
+    for r in inv_rows:
+        r_lvl = (r[11] or "medium").lower()
+        risk_stats[r_lvl] = risk_stats.get(r_lvl, 0) + 1
+        if r_lvl in {"fatal", "high"}:
+            app_key = r[4].strip().lower()
+            if app_key not in seen_veto:
+                seen_veto.add(app_key)
+                hard_veto_rules.append({
+                    "path_id": r[0],
+                    "issue_id": r[1],
+                    "project": r[2],
+                    "approach": r[4],
+                    "reason": r[5],
+                    "side_effect": r[7] or "",
+                    "failure_mode": r[6] or "",
+                    "risk_level": r_lvl,
+                    "branch_type": r[10] or "attempt"
+                })
+
+    verified_sops = []
+    for s in sol_rows:
+        verified_sops.append({
+            "issue_id": s[0],
+            "project": s[1],
+            "subject": s[2],
+            "root_cause": s[3],
+            "solution": s[4],
+            "conditions": s[5] or "無特定限制",
+            "confidence": s[7],
+            "commit_hash": s[8] or ""
+        })
+
+    meta_heuristics = [
+        "1. 進入排查前，優先調用 answer 撈出 [HARD VETO] 清單，一票否決致命級失敗路徑。",
+        "2. 針對硬體/韌體專案，優先檢查 conditions 與韌體版本，絕不跨架構盲套 workaround。",
+        "3. 除錯推演應紀錄探索樹 (Hypothesis -> Probe -> Fix)，失敗嘗試必須立即寫入 reject-path 帶上 --risk-level。"
+    ]
+
+    policy_data = {
+        "status": "success",
+        "synthesized_at": utc_now_iso(),
+        "scope_project": project or "ALL_PROJECTS",
+        "total_analyzed_issues": total_issues,
+        "total_invalid_paths": len(inv_rows),
+        "risk_distribution": risk_stats,
+        "hard_veto_rules": hard_veto_rules,
+        "verified_fast_path_sops": verified_sops[:10],
+        "meta_heuristics": meta_heuristics
+    }
+
+    markdown_content = f"""# Project Memory Exploration Policy (Dream-RSI Synthesized)
+- **Scope**: `{project or 'ALL_PROJECTS'}`
+- **Generated**: `{policy_data['synthesized_at']}`
+- **Evidence Base**: {total_issues} issues, {len(inv_rows)} exploration branches ({risk_stats.get('fatal', 0)} fatal, {risk_stats.get('high', 0)} high-risk)
+
+---
+
+## 🚫 1. HARD VETO Rules (Strictly Prohibited Paths)
+These approaches caused fatal or severe hardware/system side-effects in past explorations. **Do NOT propose or execute:**
+"""
+    if hard_veto_rules:
+        for v in hard_veto_rules:
+            se_part = f" | 副作用: {v['side_effect']}" if v['side_effect'] else ""
+            markdown_content += f"- **[{v['risk_level'].upper()}] {v['approach']}** (工單 #{v['issue_id']}): {v['reason']}{se_part}\n"
+    else:
+        markdown_content += "- (目前尚無 FATAL/HIGH 級別的硬性否決記錄)\n"
+
+    markdown_content += """
+---
+
+## 🎯 2. Verified Fast-Path SOPs
+High-confidence solutions validated by tests/commits:
+"""
+    if verified_sops:
+        for s in verified_sops[:10]:
+            cond_part = f" (條件: {s['conditions']})" if s['conditions'] and s['conditions'] != '無特定限制' else ""
+            markdown_content += f"- **#{s['issue_id']} {s['subject']}**{cond_part}\n  - 根因: {s['root_cause']}\n  - 解法: {s['solution']}\n"
+    else:
+        markdown_content += "- (目前尚無已結案之 SOP 記錄)\n"
+
+    markdown_content += """
+---
+
+## 🧭 3. Meta-Exploration Heuristics
+"""
+    for h in meta_heuristics:
+        markdown_content += f"- {h}\n"
+
+    if output_rules:
+        out_path = os.path.abspath(os.path.expanduser(output_rules))
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(markdown_content)
+        policy_data["output_rules_path"] = out_path
+
+    if format_type == "markdown" and not output_rules:
+        print(markdown_content)
+    else:
+        output_json(policy_data, pretty)
 
 def parse_kv_pairs(kv_list):
     result = {}
@@ -2220,6 +2575,9 @@ def main():
     inv_p.add_argument('--failure-mode', default="", help="失效模式 (例如: 競態條件引發 401)")
     inv_p.add_argument('--side-effect', default="", help="引發之副作用 (例如: CPU 100％ 滿載)")
     inv_p.add_argument('--scope', default="", help="生效範疇 (例如: multi-instance load balancer)")
+    inv_p.add_argument('--parent-id', type=int, default=None, help="父嘗試/假說節點 ID (構成假說推演樹)")
+    inv_p.add_argument('--branch-type', default="attempt", choices=["hypothesis", "probe", "workaround", "fix_attempt", "attempt"], help="探索分支類型")
+    inv_p.add_argument('--risk-level', default="medium", choices=["fatal", "high", "medium", "low"], help="失敗風險層級 (fatal: 致命硬體損壞/斷電, high: 系統崩潰/資料損毀, medium: 功能失效, low: 輕微錯誤)")
 
     # 4. close / resolve 指令
     close_p = subparsers.add_parser('close', aliases=['resolve'], parents=[common_parser], help="結案並寫入根因、解法、AI Summary 與 Git 錨定")
@@ -2354,7 +2712,13 @@ def main():
     # 19. doctor / stats 指令
     subparsers.add_parser('doctor', aliases=['stats'], parents=[common_parser], help="系統健康檢查、資料庫狀態與專案統計")
 
-    # 20. save 指令 (舊版相容)
+    # 20. dream 指令 (Dream-RSI 離線策略提煉)
+    dream_p = subparsers.add_parser('dream', aliases=['synthesize-policy', 'distill'], parents=[common_parser], help="Dream-RSI 離線策略提煉 (回顧探索樹並提煉專案 SOP 與否決規則)")
+    dream_p.add_argument('--project', default=None, help="限定提煉專案名稱 (選填)")
+    dream_p.add_argument('--output-rules', default=None, help="輸出 Agent 規則檔案路徑 (.md)")
+    dream_p.add_argument('--format', default="json", choices=["json", "markdown"], help="輸出格式 (json 或 markdown)")
+
+    # 21. save 指令 (舊版相容)
     save_p = subparsers.add_parser('save', parents=[common_parser], help="[相容舊版] 儲存記憶")
     save_p.add_argument('--project', required=True)
     save_p.add_argument('--title', required=True)
@@ -2421,6 +2785,9 @@ def main():
                 failure_mode=args.failure_mode,
                 side_effect=args.side_effect,
                 scope=args.scope,
+                parent_path_id=getattr(args, 'parent_id', None),
+                branch_type=getattr(args, 'branch_type', 'attempt'),
+                risk_level=getattr(args, 'risk_level', 'medium'),
                 allow_secret=allow_secret,
                 db_path=db_path,
                 pretty=pretty
@@ -2562,6 +2929,14 @@ def main():
             reindex(db_path=db_path, pretty=pretty)
         elif args.command in ['doctor', 'stats']:
             doctor(db_path=db_path, pretty=pretty)
+        elif args.command in ['dream', 'synthesize-policy', 'distill']:
+            dream_policy(
+                project=args.project,
+                output_rules=args.output_rules,
+                format_type=args.format,
+                db_path=db_path,
+                pretty=pretty
+            )
         elif args.command == 'save':
             handle_legacy_save(args)
     except Exception as e:

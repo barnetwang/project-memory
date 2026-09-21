@@ -1,14 +1,14 @@
 ---
 name: project-memory
 description: "Before starting or retrying any BIOS/UEFI, platform-hardware, or firmware engineering debug, recall verified cases + known-bad paths (negative knowledge) so a past failure isn't repeated. Load on ANY such debug or before concluding a root cause: the topic examples (S3/S4 sleep, ACPI, USB, power, GPU, EC/GPIO, SPI) only aid recall — they are NOT the gate."
-version: 3.3.0
+version: 3.4.0
 author: Barnet Wang
 license: Apache-2.0
 ---
 
-# Failure-Aware Episodic Engineering Memory Skill (v3.2.2)
+# Failure-Aware Episodic Engineering Memory Skill (v3.4.0 Dream-RSI)
 
-This skill gives the agent a persistent, cross-conversation memory of **structured engineering decisions and negative knowledge**. It is optimized for **open-source local small models (7B / 14B)** and for **environments mixing Traditional/Simplified Chinese, English, and ACPI underscore-named paths**.
+This skill gives the agent a persistent, cross-conversation memory of **structured engineering decisions, exploration trees, and negative knowledge**. Inspired by **Google Dream-RSI** (*Recursive Self-Improvement through Evolving Worlds*), it transforms static ticket caching into an active exploration policy guide with risk-aware pruning and offline policy synthesis.
 
 ---
 
@@ -18,24 +18,36 @@ This skill gives the agent a persistent, cross-conversation memory of **structur
 * **Agent decision evidence card (`answer` / `card`)**: **the recommended first call when a session starts**.
   - Token-level hybrid retrieval with synonym / Traditional↔Simplified expansion (e.g. `蓝屏` ↔ `藍屏` ↔ `bsod`, `睡眠` ↔ `s3`).
   - `--platform` and `--env` matching filters are applied automatically.
-  - Tickets that have been superseded are flagged with a `superseded` warning and tracked.
-  - One call returns: the best verified solution, its applicability constraints (`conditions`), the code commit, and the do-not-try list (`do_not_try`).
+  - **Risk-aware pruning & `[HARD VETO]`**: Fatal/high-risk attempts are sorted to the top and flagged with hard vetoes.
+  - **Diagnostic Policy Sequence (`diagnostic_policy`)**: Returns ordered SOP steps, pruned branch histories, and verification checks.
+  - One call returns: the best verified solution, applicability constraints (`conditions`), code commit, and the do-not-try list (`do_not_try`).
 * **Retrieve verified solutions (`search --verified-only`)**:
-  - Stage 1 output carries a **`decision` directive field** (`adopt` / `avoid` / `candidate` / `superseded`) — small models can act on it directly without reasoning through the state machine.
+  - Stage 1 output carries a **`decision` directive field** (`adopt` / `avoid` / `candidate` / `superseded`).
 * **Retrieve negative knowledge (`search --negative-only` / `search-invalid`)**:
-  - Token-split OR matching (e.g. `I2C reset` also matches `forced reset of the I2C controller register`; reversed word order still hits) — use it to **prune reasoning and avoid repeating a known failure**.
+  - Token-split OR matching — use it to **prune reasoning and avoid repeating a known failure**.
 * **Dedupe before opening a ticket (`similar`)**: **always** run `similar --subject "..."` **before** creating a new issue.
 
-### 2. During Investigation & Trial-Error (Note & Reject-Path — maintain the debug map)
+### 2. During Investigation & Trial-Error (Note & Reject-Path — build the exploration tree)
 * Use `note` to record investigation steps and experimental observations.
-* When an attempt (Approach) fails, **immediately** record it with `reject-path`: the invalid path, the reason it failed, the failure mode, side effects, and the scope it applies to.
+* When an attempt fails, **immediately** record it with `reject-path`:
+  - `--approach`, `--reason`, `--failure-mode`, `--side-effect`, `--scope`
+  - **Exploration Tree (`--parent-id`, `--branch-type`)**: Link child attempts to parent hypotheses (`hypothesis`, `probe`, `workaround`, `fix_attempt`).
+  - **Risk Level (`--risk-level`)**: Tag with `fatal` (hardware trip/RTC lost), `high` (crash/corruption), `medium`, or `low`.
+  - **MANDATORY: `--risk-level` is never omitted** (standing user commitment, 2026-09-21).
+    Classification: `fatal` = power trip / hardware damage / RTC loss / protection-circuit event;
+    `high` = crash, data or flash corruption, boot-brick risk;
+    `medium` = failed path needing a reboot or significant time;
+    `low` = compile/log-level dead end, trivial cost. When in doubt, over-rate, not under-rate.
 
 ### 3. Resolution & Closure (Close & Verify — anchor to real evidence)
 * Use `close` to record the **root cause** and the **solution** explicitly.
-* If the fix is validated by tests or CI, use `verify` to bind the Git commit hash to the test/CI evidence and raise confidence to the highest level, `Verified`.
+* If the fix is validated by tests or CI, use `verify` to bind the Git commit hash to the test/CI evidence and raise confidence to `Verified`.
 
-### 4. Deep Dive (Stage 2: `get --agent`)
-* When reading a specific ticket, small models can add `--agent` / `--brief`: the system strips the voluminous history and returns only the last 3 key notes, commit evidence, and the do-not-try list — **saves 80%+ of tokens**.
+### 4. Offline Dreaming & Meta-Policy Synthesis (`dream` / `synthesize-policy`)
+* Run `dream --project <proj> --output-rules <path.md>` to distill exploration histories into actionable system rules and SOP heuristics for agents.
+
+### 5. Deep Dive (Stage 2: `get --agent`)
+* Low-token decision packet: strips verbose journal history and returns only the last 3 key notes, commit evidence, and do-not-try constraints with risk levels.
 
 ---
 
@@ -54,37 +66,38 @@ This skill gives the agent a persistent, cross-conversation memory of **structur
 
 ## CLI Reference
 
-Script location: `scripts/memory_manager.py` (supports the global `--db <path>` option).
+Script location: `scripts/memory_manager.py` (supports global `--db <path>`).
 
 ### 1. Agent decision evidence card (`answer` / `card`)
 ```bash
-# One-shot: best solution, applicability conditions, code evidence, do-not-try list
-# (supports Traditional/Simplified Chinese, synonym, and abbreviation expansion)
+# One-shot: best solution, diagnostic policy, code evidence, hard veto list
 python scripts/memory_manager.py answer --query "ACPI S3 Sleep Hang" --project "KernelDriver" --platform "Intel-ARL"
 ```
 
-### 2. Dedupe & create ticket (`similar` / `create`)
+### 2. Append exploration branches with risk levels (`reject-path`)
 ```bash
-# Dedupe first (prevents memory-store bloat)
+# Record root hypothesis/probe
+python scripts/memory_manager.py reject-path --id 1 --approach "Read EC register status" --reason "EC firmware timed out" --branch-type "probe" --risk-level "medium"
+
+# Record child attempt with fatal risk (HARD VETO)
+python scripts/memory_manager.py reject-path --id 1 --approach "Force reset EC controller" --reason "Tripped PMIC protection circuit" --side-effect "System power loss and lost RTC" --parent-id 1 --branch-type "fix_attempt" --risk-level "fatal"
+```
+
+### 3. Offline Dreaming & Policy Distillation (`dream`)
+```bash
+# Synthesize exploration policies and export agent rule file
+python scripts/memory_manager.py dream --project "KernelDriver" --output-rules .gemini/rules/kerneldriver_policy.md
+```
+
+### 4. Dedupe & create ticket (`similar` / `create`)
+```bash
 python scripts/memory_manager.py similar --subject "ACPI S3 Sleep Hang"
-
-# Create a new ticket
-python scripts/memory_manager.py create --project "KernelDriver" --subject "ACPI S3 sleep hang on Type-C attach" --tracker "Bug" --module "power" --env "baremetal" --error-code "0x0000009F" --platform "Intel-ARL" --board "EVB-RVP" --bios-ver "v1.2.0" --scope "S3-resume"
+python scripts/memory_manager.py create --project "KernelDriver" --subject "ACPI S3 sleep hang on Type-C attach" --tracker "Bug" --platform "Intel-ARL"
 ```
 
-### 3. Append investigation notes & fine-grained negative knowledge (`note` / `reject-path`)
+### 5. Closure & verification (`close` / `verify`)
 ```bash
-# Record an investigation note
-python scripts/memory_manager.py note --id 1 --notes "During S3 resume, the Type-C PD controller failed to release the I2C bus in time."
-
-# Record fine-grained negative knowledge
-python scripts/memory_manager.py reject-path --id 1 --approach "forced reset of the I2C controller register" --reason "put the power-management chip into protection mode" --failure-mode "system lost power and rebooted" --side-effect "fans spun at full speed and RTC time was lost" --scope "platform=Intel-ARL"
-```
-
-### 2. Closure & highest-confidence verification (`close` / `verify`)
-```bash
-# Close the ticket
-python scripts/memory_manager.py close --id 1 --root-cause "race between Type-C PD firmware and the BIOS ACPI method" --solution "add a 50ms delay in _PTS and wait for the PD state to be ready" --conditions "only for PD firmware >= v2.0" --commit-hash "9f8e7d6c5b4a"
+python scripts/memory_manager.py close --id 1 --root-cause "race between Type-C PD firmware and the BIOS ACPI" --solution "add 50ms delay in _PTS" --commit-hash "9f8e7d6c5b4a"
 
 # Promote to Verified — two pitfalls:
 #   1. commit verification runs `git` in the CURRENT directory, so cd into
@@ -98,28 +111,9 @@ cd /path/to/repo && python /abs/path/to/scripts/memory_manager.py verify \
   --evidence-note "passed 100 S3 stress cycles"
 ```
 
-### 5. Two-stage retrieval (`search` / `search-invalid` / `get --agent`)
+### 6. Two-stage retrieval & maintenance (`search-invalid` / `get --agent` / `doctor`)
 ```bash
-# Stage 1: verified solutions (returns results with the decision field)
-python scripts/memory_manager.py search --project "KernelDriver" --query "睡眠 藍屏" --verified-only
-
-# Stage 1: query negative-knowledge entries directly (reversed-word and sub-path matching)
 python scripts/memory_manager.py search-invalid --query "I2C reset"
-
-# Stage 2: low-token decision packet for small models
 python scripts/memory_manager.py get --id 1 --agent
-```
-
-### 6. Redaction, backup & maintenance (`redact-issue` / `export` / `import` / `doctor`)
-```bash
-# Fully redact a sensitive ticket and wipe the WAL log
-python scripts/memory_manager.py redact-issue --id 1 --reason "GDPR"
-
-# Backup & import
-python scripts/memory_manager.py export --file backup.jsonl
-python scripts/memory_manager.py import --file backup.jsonl --dedupe
-
-# Health check & project statistics
 python scripts/memory_manager.py doctor
-python scripts/memory_manager.py reindex
 ```
