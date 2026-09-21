@@ -5,10 +5,10 @@
 <h1 id="繁體中文">Agent Episodic Engineering Memory (v3.4.0 - Dream-RSI Edition)</h1>
 
 > **v3.4.0 (2026-09-21) Google Dream-RSI 架構深度升級**
-> - **探索歷程樹 (Exploration Trees / DAG)**：負向知識全面支援樹狀推導結構 (`--parent-id` 與 `--branch-type`: root / child / retry / pivot)，完整還原假說演變與追溯因果鏈。
+> - **探索歷程樹 (Exploration Trees / DAG)**：負向知識全面支援樹狀推導結構 (`--parent-id` 與 `--branch-type`: hypothesis / probe / workaround / fix_attempt)，完整還原假說演變與追溯因果鏈。
 > - **代價與風險感知剪枝 (Risk-Aware Pruning & Hard VETO)**：負向經驗導入四級風險評估 (`fatal` / `high` / `medium` / `low`)。在 `answer` 查詢中以 `[HARD VETO]` 標籤置頂呈現高危禁忌（如硬體損壞、死鎖），杜絕 Agent 重蹈毀滅性覆轍。
 > - **排查決策策略流 (Diagnostic Policy)**：工單驗證與結案自動綜合推導排查狀態機步驟 (SOP Sequence)，引導 Agent 依循正規階梯式驗證歷程。
-> - **離線做夢與元策略提煉 (Offline Dreaming & Meta-Policy Synthesis)**：全新 `dream` CLI 指令，自動聚合跨工單的探索樹、死胡同模式與解法，提煉為全域架構守則與除錯策略，並自動匯出 Agent 規則檔案 (`rules/*.md`) 與 JSON 知識庫。
+> - **離線做夢與元策略提煉 (Offline Dreaming & Meta-Policy Synthesis)**：全新 `dream` CLI 指令，聚合跨工單的探索樹、死胡同模式與解法，提煉為全域架構守則與除錯策略；預設輸出結構化 JSON，搭配 `--output-rules <path>.md` 另存一份 Agent 規則檔。
 > - **資料庫結構升級 (Schema v4)**：自動無縫相容遷移，匯出/匯入具備階層 ID 重新映射機制，`doctor` 全面納入風險分佈統計與懸掛父節點健全性自檢。
 > - **已知問題修正 (v3.4.0 hotfix, 2026-09-21)**：v4 遷移在既有 v3 資料庫上會因索引先於新欄位建立而中斷（`no such column: parent_path_id`，且 DB 停在半遷移狀態）；已修正建立順序並加入 v3→v4 遷移回歸測試。
 
@@ -50,10 +50,11 @@
 
 ### 5. 探索歷程樹 (Exploration Trees / DAG)
 - 傳統記憶系統僅記錄扁平的「成功」或「失敗」，遺失了推導上下文。v3.4.0 支援將除錯嘗試記錄為樹狀結構：
-  - `root`：初始嘗試或主假設。
-  - `child`：基於前一步驟產生的子推導或局部調整。
-  - `retry`：在相同思路下的重試或參數微調。
-  - `pivot`：推翻原假說、轉向全新技術路線的重大轉折。
+  - `hypothesis`：主假設層級的嘗試或初步推斷。
+  - `probe`：為驗證假設而採取的侦查性操作 (讀暫存器、抓 log、測訊號)。
+  - `workaround`：繞過問題而非修正根因的臨時方案。
+  - `fix_attempt`：直接指向根因修正方案的嘗試。
+- 透過 `--parent-id` 將子分支掛到父分支下，並用 `branch_type` 標記分支性質；預設為 `attempt` (一般嘗試)。
 - 完整保存 Agent 「思考—嘗試—受挫—轉向」的演化歷程。
 
 ### 6. 代價感知與高危剪枝 (Risk-Aware Hard VETO)
@@ -69,7 +70,7 @@
 - 借鏡 Google Dream-RSI 核心概念，在沒有即時問題的空閒階段，執行 `dream` 提煉全局智慧：
   - 自動跨工單掃描失敗叢集，識別共同的系統性脆弱點與盲區。
   - 提煉黃金排查路徑與通用架構守則。
-  - 自動生成 Markdown 規則檔 (`rules/<project>_synthesis_rules.md`)，無縫供 Cursor / Claude / Antigravity Agent 等工具直接作為系統 System Rules 載入。
+  - 預設輸出結構化 JSON (含 hard_veto_rules、risk_distribution、verified_fast_path_sops)；搭配 `--output-rules <path>.md` 另存一份 Markdown 規則檔，可被 Cursor / Claude / Antigravity 等工具直接載入為 System Rules。
 
 ---
 
@@ -103,15 +104,15 @@ python scripts/memory_manager.py reject-path --id 1 \
   --side-effect "風扇全速運轉且遺失 RTC 時間" \
   --scope "platform=Intel-ARL" \
   --risk-level "fatal" \
-  --branch-type "root"
+  --branch-type "hypothesis"
 
-# 記錄基於上一步嘗試的子分支 (child)
+# 記錄基於上一步嘗試的子分支 (fix_attempt)
 python scripts/memory_manager.py reject-path --id 1 \
   --approach "降頻重送 I2C 重設命令" \
   --reason "PMIC 依然觸發保護" \
   --failure-mode "掛死" \
   --parent-id 1 \
-  --branch-type "child" \
+  --branch-type "fix_attempt" \
   --risk-level "high"
 ```
 
@@ -138,8 +139,12 @@ python scripts/memory_manager.py get --id 1 --agent
 
 ### 6. 離線做夢提煉策略 (`dream`)
 ```bash
-# 離線做夢：從歷史探索樹與失敗模式提煉全局策略，並產出 Agent 規則檔案
-python scripts/memory_manager.py dream --project "KernelDriver" --output-dir "rules"
+# 離線做夢：從歷史探索樹與失敗模式提煉全局策略
+#   --format json     (預設) 輸出結構化 JSON 到 stdout
+#   --format markdown       輸出 Markdown 到 stdout
+#   --output-rules <path>.md   另存一份 Agent 規則檔 (需搭配任一 format)
+python scripts/memory_manager.py dream --project "KernelDriver"
+python scripts/memory_manager.py dream --project "KernelDriver" --output-rules "rules/kerneldriver_policy.md"
 ```
 
 ### 7. 機密脫敏、備份與維運 (`redact-issue` / `export` / `import` / `doctor`)
@@ -165,10 +170,10 @@ python scripts/memory_manager.py reindex
 <h1 id="english">Agent Episodic Engineering Memory (v3.4.0 - Dream-RSI Edition)</h1>
 
 > **v3.4.0 (2026-09-21) Google Dream-RSI Architectural Upgrade**
-> - **Exploration Trees / DAG**: Negative knowledge paths now support hierarchical hypothesis progression via `--parent-id` and `--branch-type` (`root`, `child`, `retry`, `pivot`), preserving the chain of failure reasoning.
+> - **Exploration Trees / DAG**: Negative knowledge paths now support hierarchical hypothesis progression via `--parent-id` and `--branch-type` (`hypothesis`, `probe`, `workaround`, `fix_attempt`, `attempt`), preserving the chain of failure reasoning.
 > - **Cost & Risk-Aware Pruning (Hard VETO)**: Negative knowledge tagged with 4 risk tiers (`fatal`, `high`, `medium`, `low`). Queries via `answer` enforce a `[HARD VETO]` policy placing dangerous dead-ends at the top of the prompt to prevent catastrophic debugging actions.
 > - **Diagnostic Policy Flow**: Closed tickets synthesize SOP state machine sequences guiding agents along proven validation trajectories.
-> - **Offline Dreaming & Meta-Policy Synthesis**: The new `dream` CLI command synthesizes architectural rules and anti-patterns across exploration trees and exports ready-to-use Agent rule files (`rules/*.md`).
+> - **Offline Dreaming & Meta-Policy Synthesis**: The new `dream` CLI command synthesizes architectural rules and anti-patterns across exploration trees. Outputs structured JSON by default; pass `--output-rules <path>.md` to additionally save an Agent rule file.
 > - **Database Schema v4**: Seamless migration, parent-child ID remapping during export/import, and enhanced `doctor` diagnostics for risk distribution and dangling node audits.
 > - **Known-fix (v3.4.0 hotfix, 2026-09-21)**: v4 migration aborted on pre-existing v3 databases because two indexes were created before the new columns existed (`no such column: parent_path_id`, leaving the DB half-migrated); build order fixed and a v3→v4 migration regression test added.
 
@@ -194,7 +199,7 @@ An industrial-grade, **Failure-Aware, Evidence-Grounded** episodic project memor
 
 ## Dream-RSI Enhancements
 
-5. **Exploration Trees (DAG Reasoning)**: Replaces flat failure logs with hypothesis trees tracking parent-child links (`root`, `child`, `retry`, `pivot`).
+5. **Exploration Trees (DAG Reasoning)**: Replaces flat failure logs with hypothesis trees tracking parent-child links (`hypothesis`, `probe`, `workaround`, `fix_attempt`, `attempt`).
 6. **Risk-Aware Pruning (`[HARD VETO]`)**: Fatal/high risk approaches are surfaced at the very top of context payloads with explicit veto warnings.
 7. **Diagnostic Policy Flow**: Synthesizes verified issue sequences into actionable step-by-step diagnostic workflows.
-8. **Offline Dreaming (`dream`)**: Synthesizes cross-ticket anti-patterns and rules into Markdown rule files ready for consumption by AI agents.
+8. **Offline Dreaming (`dream`)**: Synthesizes cross-ticket anti-patterns and rules; structured JSON by default, or a Markdown rule file via `--output-rules <path>.md` for AI-agent consumption.
